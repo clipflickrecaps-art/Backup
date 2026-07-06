@@ -14,8 +14,10 @@ Flow:
 """
 
 import asyncio
+import json
 import logging
 import os
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional
 
@@ -23,9 +25,27 @@ from telethon import TelegramClient, events
 from telethon.errors import ChannelInvalidError, ChannelPrivateError, FloodWaitError
 
 import db
-from config import API_ID, API_HASH, BACKUP_CHANNEL_ID, SESSION_DIR
+from config import (API_ID, API_HASH, BACKUP_CHANNEL_ID, SESSION_DIR,
+                    BOT_TOKEN, ADMIN_CHAT_ID)
 
 log = logging.getLogger("session_mgr")
+
+
+def _bot_api(method: str, payload: dict) -> Optional[dict]:
+    """Call the Telegram Bot API synchronously (stdlib only)."""
+    if not BOT_TOKEN:
+        return None
+    try:
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        log.warning("Bot API %s failed: %s", method, exc)
+        return None
 
 # ─── Global registry ─────────────────────────────────────────────────────────
 # Keyed by the DB user.id  (integer primary key, NOT telegram_id)
@@ -361,7 +381,13 @@ class UserSession:
             except FloodWaitError as fw:
                 log.warning("[%s] Flood wait %ss for @%s",
                             self.session_name, fw.seconds, username)
-                await asyncio.sleep(fw.seconds + 1)
+                await self._flood_wait_countdown(
+                    username, fw.seconds + 1, target["user_id"])
+                try:
+                    await self.client.forward_messages(dest, message)
+                except Exception as exc:
+                    log.error("[%s] Retry after flood wait failed for msg %s: %s",
+                              self.session_name, message.id, exc)
             except (ChannelInvalidError, ChannelPrivateError):
                 log.error("[%s] Cannot forward to channel=%s", self.session_name, dest)
                 break
@@ -374,6 +400,51 @@ class UserSession:
         db.mark_backfilled(target["id"])
         log.info("[%s] Backfill done @%s (%s new, %s skipped).",
                  self.session_name, username, count, skipped)
+
+    # ------------------------------------------------------------------
+    async def _flood_wait_countdown(self, username: str, seconds: int,
+                                    user_db_id: int) -> None:
+        """Wait out a Telegram flood wait while showing a live countdown
+        in the control bot (message edited once per minute)."""
+        chat_id = None
+        user = db.get_user_by_id(user_db_id)
+        if user and user.get("telegram_id"):
+            chat_id = user["telegram_id"]
+        elif ADMIN_CHAT_ID:
+            chat_id = ADMIN_CHAT_ID
+
+        total = max(int(seconds), 1)
+        message_id = None
+        if chat_id:
+            mins = (total + 59) // 60
+            resp = await asyncio.to_thread(_bot_api, "sendMessage", {
+                "chat_id": chat_id,
+                "text": (f"⏳ Telegram flood limit ကြောင့် @{username} backup "
+                         f"ကို ခဏရပ်ထားပါတယ်။\nကျန်ချိန် — {mins} မိနစ်"),
+            })
+            if resp and resp.get("ok"):
+                message_id = resp["result"]["message_id"]
+
+        remaining = total
+        while remaining > 0:
+            step = min(60, remaining)
+            await asyncio.sleep(step)
+            remaining -= step
+            if message_id and remaining > 0:
+                mins = (remaining + 59) // 60
+                await asyncio.to_thread(_bot_api, "editMessageText", {
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "text": (f"⏳ @{username} backup — "
+                             f"ကျန်ချိန် {mins} မိနစ်..."),
+                })
+
+        if message_id:
+            await asyncio.to_thread(_bot_api, "editMessageText", {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": f"▶️ @{username} backup ပြန်စတင်နေပါပြီ။",
+            })
 
     # ------------------------------------------------------------------
     async def clear_channel_and_reset(self, target_username: str) -> str:

@@ -179,6 +179,15 @@ def get_user(telegram_id: int) -> Optional[dict]:
         return dict(row) if row else None
 
 
+def get_user_by_id(user_db_id: int) -> Optional[dict]:
+    """Return a user row by internal database id (users.id)."""
+    with get_conn() as c:
+        row = c.execute(
+            "SELECT * FROM users WHERE id = ?", (user_db_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
 def get_active_users() -> list:
     with get_conn() as c:
         rows = c.execute(

@@ -1,0 +1,1 @@
+- [Duplicate workflow from artifact registration](duplicate-workflow-artifact.md) — phantom auto-restarting workflows come from `<dir>/.replit-artifact`; delete that dir to unregister.
